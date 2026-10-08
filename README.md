@@ -123,7 +123,45 @@ SmoothWinTray.exe --uninstall      卸载计划任务
 
 ---
 
-## 五、设计原则（也是几条硬规矩）
+## 五、构建与验证状态
+
+本仓库的 CI 会在 **windows-latest** 上真编译、真跑一次冒烟测试：
+
+| 步骤 | 结果 |
+| --- | --- |
+| 定位 `csc.exe` | ✅ `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe` |
+| 编译 | ✅ 退出码 0，无警告，产出 159744 字节 |
+| 冒烟测试 `--report` | ✅ 退出码 0，报告写出且内容校验通过 |
+| 上传产物 | ✅ artifact `SmoothWinTray` |
+
+冒烟测试在干净的 Server 2025 runner（16 GB 内存）上真实跑出来的片段：
+
+```
+SmoothWin 命令行模式: report    2026-10-08 05:48:56
+管理员: True    数据目录: C:\Users\runneradmin\AppData\Local\SmoothWin
+
+物理内存 : 可用 13699 MB / 共 16378 MB
+提交内存 : 2468 MB / 19322 MB  (13%)  阈值 82%
+非分页池 : 151 MB    分页池 : 129 MB
+          告警线 1003 MB（按本机物理内存 16378 MB 推算）
+阈值来源 : 提交/压缩/整理下限 均已按本机物理内存(16378MB)自动设定，可在「设置」里改
+```
+
+> 注意阈值那一行：同一份二进制在 16 GB 的 runner 上算出 **82% / 818 MB / 1003 MB**，在 64 GB 的开发机上算出 **88% / 3236 MB / 2453 MB**。这就是"按物理内存自适应"的实际表现，不是写死的数字。
+
+### 本地怎么自证
+
+```cmd
+build.cmd                          :: 编译
+SmoothWinTray.exe --report         :: 看一眼当前机器的阈值和状态
+SmoothWinTray.exe --selftest       :: 注册表 / 性能计数器 / 事件日志 / API 可用性自检
+SmoothWinTray.exe --uicheck        :: 状态窗口排版自检（按钮有没有被裁）
+SmoothWinTray.exe --leaktest       :: 增长提醒忽略名单读写自检
+```
+
+---
+
+## 六、设计原则（也是几条硬规矩）
 
 1. **不碰正在用的东西。** 有窗口在用、正在跑任务、在冷却期内的进程一律跳过。
 2. **不自动禁用任何自启项、不自动结束任何进程。** 只提供开关，决定权在用户。
@@ -134,7 +172,7 @@ SmoothWinTray.exe --uninstall      卸载计划任务
 
 ---
 
-## 六、运行环境
+## 七、运行环境
 
 - Windows 10 1903+ / Windows 11（自带 .NET Framework 4.8）
 - 需要管理员权限的功能（自启任务、系统级修复、部分注册表写入）会单独提示；其余功能普通权限即可
