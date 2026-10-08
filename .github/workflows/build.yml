@@ -49,6 +49,20 @@ jobs:
           Write-Host $txt
           if ($txt -notmatch 'SmoothWin 命令行模式') { throw "报告内容不对" }
 
+      - name: 冒烟测试（--apps，后台应用进程树）
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'smoke-apps.txt'
+          $p = Start-Process -FilePath (Resolve-Path out\SmoothWinTray.exe) `
+               -ArgumentList @('--apps', '--out', $out) -PassThru -WindowStyle Hidden
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); throw "冒烟测试超时（180 秒）" }
+          if ($p.ExitCode -ne 0) { throw "冒烟测试退出码 = $($p.ExitCode)" }
+          if (-not (Test-Path $out)) { throw "没有写出后台应用清单" }
+          $txt = Get-Content $out -Raw -Encoding UTF8
+          $head = ($txt -split "`n" | Select-Object -First 12) -join "`n"
+          Write-Host $head
+          if ($txt -notmatch '顶层程序:') { throw "清单内容不对（没有顶层程序统计）" }
+
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:

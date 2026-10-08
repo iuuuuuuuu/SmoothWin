@@ -163,6 +163,59 @@ namespace SmoothWinTray
         [DllImport("user32.dll")]
         internal static extern int GetWindowThreadProcessId(IntPtr hWnd, out int pid);
 
+        // 每个进程「有没有窗口、哪个是主窗口」。一次 EnumWindows 全扫完，
+        // 不能按进程去扫（421 个进程 × 一次全枚举 = 界面直接卡死）。
+        internal static Dictionary<int, IntPtr> TopWindows()
+        {
+            Dictionary<int, IntPtr> r = new Dictionary<int, IntPtr>();
+            try
+            {
+                EnumWindows(delegate (IntPtr h, IntPtr l)
+                {
+                    try
+                    {
+                        if (!IsWindowVisible(h)) return true;
+                        int p;
+                        if (GetWindowThreadProcessId(h, out p) == 0 || p <= 0) return true;
+                        if (!r.ContainsKey(p)) r[p] = h;
+                        // 已经记下的那个是最小化窗口、现在这个是正常显示的 → 换成这个
+                        else if (IsIconic(r[p]) && !IsIconic(h)) r[p] = h;
+                    }
+                    catch { }
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { }
+            return r;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool QueryFullProcessImageNameW(IntPtr h, uint flags, StringBuilder buf, ref int size);
+
+        // 进程的完整 exe 路径。用已有的句柄取，不再多开一次进程句柄。
+        internal static string ProcessPathOf(IntPtr h)
+        {
+            try
+            {
+                if (h == IntPtr.Zero) return "";
+                StringBuilder sb = new StringBuilder(1024);
+                int n = sb.Capacity;
+                if (!QueryFullProcessImageNameW(h, 0, sb, ref n)) return "";
+                return sb.ToString(0, n);
+            }
+            catch { return ""; }
+        }
+
+        // 关窗口（温和）与切到前台。给用户的选项里「关窗口」是最轻的一个：
+        // 程序该保存的自己会弹框，比直接结束进程安全得多。
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+
+        [DllImport("user32.dll")]
+        internal static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        internal const uint WM_CLOSE = 0x0010;
+
         // 「用户是不是点过退出」用一个内核事件对象来记，而不是标志文件：
         //   · 事件属于内核对象，进程/机器重启后自动消失，不会留下一块需要清理的状态；
         //   · 计划任务的定时触发器同样是内核对象，用户点退出后会被关掉、不再触发，
@@ -2012,7 +2065,7 @@ namespace SmoothWinTray
         // ---------- 结束进程 ----------
         // 系统组件一律不碰：误杀 explorer / csrss 之类会把桌面搞崩，
         // 而用户想「关掉」的从来不是这些。
-        private static readonly string[] NeverKill = new string[] {
+        internal static readonly string[] NeverKill = new string[] {
             "System", "Idle", "Registry", "Memory Compression", "csrss", "wininit", "winlogon",
             "services", "lsass", "smss", "dwm", "audiodg", "fontdrvhost", "Secure System", "LsaIso",
             "explorer", "sihost", "taskhostw", "RuntimeBroker", "ShellExperienceHost",
@@ -2109,6 +2162,1075 @@ namespace SmoothWinTray
             b.AppendLine("建议保留：远程控制类（向日葵 / RustDesk / UU远程）、安全软件、显卡相关。");
             b.AppendLine("可以先关：各种更新器、助手、输入法扩展、游戏平台、下载工具。");
             return b.ToString();
+        }
+    }
+
+    // ==================== 后台应用（独立窗口：进程树 / 启动时间 / 占用 / 可结束） ====================
+    // 用户要的是把「后台应用」从自启项里拆出来单独看：
+    //   · 每个程序下面挂出它的子进程（node 开 34 个、每个 dev server 一个）；
+    //   · 每个进程什么时候启动的、已经跑了多久、占多大内存；
+    //   · 想关哪个就关哪个，而且关的是「这一个进程」，不是「同名全杀」。
+    // 这里刻意不做任何自动动作：只看，只在你点的时候才动手。
+    internal class AppNode
+    {
+        public int Pid;
+        public int ParentPid;
+        public string Name = "";
+        public string Path = "";
+        public long MB;
+        public DateTime Start = DateTime.MinValue;
+        public long CpuMs;
+        public double DiskMB;
+        public int Threads;
+        public IntPtr Hwnd = IntPtr.Zero;
+        public bool HasWindow;
+        public bool IsSelf;
+        public List<AppNode> Kids = new List<AppNode>();
+        public AppNode Parent;
+        public AppNode Root;
+
+        public long TotalMB
+        {
+            get
+            {
+                long m = MB;
+                foreach (AppNode k in Kids) m += k.TotalMB;
+                return m;
+            }
+        }
+
+        public int Count
+        {
+            get
+            {
+                int n = 1;
+                foreach (AppNode k in Kids) n += k.Count;
+                return n;
+            }
+        }
+    }
+
+    internal static class AppScan
+    {
+        // 进程名 → 一句「它是干什么的」。只写确定的东西，认不出来就留空。
+        internal static string Describe(string name)
+        {
+            switch (name.ToLowerInvariant())
+            {
+                case "node": return "Node.js（开发服务器 / 构建进程）";
+                case "chrome": return "Chrome 浏览器（每个标签页一个进程）";
+                case "msedge": return "Edge 浏览器（每个标签页一个进程）";
+                case "firefox": return "Firefox 浏览器";
+                case "weixin": return "微信";
+                case "wechat": return "微信";
+                case "qq": return "QQ";
+                case "qqnt": return "QQ";
+                case "wxwork": return "企业微信";
+                case "code": return "VS Code";
+                case "devenv": return "Visual Studio";
+                case "docker desktop": return "Docker Desktop";
+                case "com.docker.backend": return "Docker 后台引擎";
+                case "explorer": return "Windows 桌面 / 文件管理器";
+                case "svchost": return "Windows 服务宿主（一个进程里跑好几个系统服务）";
+                case "dllhost": return "COM 代理（很多软件的组件跑在这里）";
+                case "runtimebroker": return "UWP 应用代理";
+                case "searchindexer": return "Windows 搜索索引";
+                case "msmpeng": return "Microsoft Defender 杀毒引擎";
+                case "qemu-system-x86_64": return "QEMU 虚拟机";
+                case "java": return "Java 虚拟机";
+                case "python": return "Python";
+                case "pythonw": return "Python";
+                case "dotnet": return ".NET 运行时宿主";
+                case "msbuild": return "MSBuild 编译进程";
+                case "git": return "Git";
+                case "conhost": return "控制台窗口宿主";
+                case "taskhostw": return "Windows 任务宿主";
+                case "dwm": return "桌面窗口管理器（合成器）";
+                case "ctfmon": return "输入法 / 文字服务";
+                default: return "";
+            }
+        }
+
+        internal static string Mb(long mb)
+        {
+            if (mb >= 10240) return (mb / 1024.0).ToString("0.0") + " GB";
+            return mb + " MB";
+        }
+
+        internal static string Dur(TimeSpan t)
+        {
+            if (t.TotalSeconds < 0) return "未知";
+            if (t.TotalDays >= 1) return (int)t.TotalDays + " 天 " + t.Hours + " 小时";
+            if (t.TotalHours >= 1) return (int)t.TotalHours + " 小时 " + t.Minutes + " 分";
+            if (t.TotalMinutes >= 1) return (int)t.TotalMinutes + " 分 " + t.Seconds + " 秒";
+            return (int)t.TotalSeconds + " 秒";
+        }
+
+        // 一个进程已经跑了多久。启动时间读不到时（系统进程）要老实说读不到，
+        // 不能拿 MinValue 去减 DateTime.Now，那会算出「739896 天」这种假数字。
+        internal static string Age(AppNode n)
+        {
+            if (n == null || n.Start == DateTime.MinValue) return "读不到";
+            return Dur(DateTime.Now - n.Start);
+        }
+
+        // 扫一遍所有进程，建成「顶层程序 → 子进程」的树。
+        // 父进程只用一次 Toolhelp32 快照拿，不按进程逐个枚举（421 个进程那样会卡死）。
+        internal static List<AppNode> Take(out string note)
+        {
+            note = "";
+            Dictionary<int, AppNode> byId = new Dictionary<int, AppNode>();
+            Dictionary<int, IntPtr> wins = Native.TopWindows();
+            int selfPid = Process.GetCurrentProcess().Id;
+            int noAccess = 0;
+
+            Dictionary<int, int> ppid = new Dictionary<int, int>();
+            Dictionary<int, int> thrd = new Dictionary<int, int>();
+            IntPtr snap = Native.CreateToolhelp32Snapshot(Native.TH32CS_SNAPPROCESS, 0);
+            if (snap != IntPtr.Zero && snap != Native.INVALID_HANDLE_VALUE)
+            {
+                try
+                {
+                    Native.PROCESSENTRY32 pe = new Native.PROCESSENTRY32();
+                    pe.dwSize = (uint)Marshal.SizeOf(typeof(Native.PROCESSENTRY32));
+                    if (Native.Process32FirstW(snap, ref pe))
+                    {
+                        do
+                        {
+                            ppid[(int)pe.th32ProcessID] = (int)pe.th32ParentProcessID;
+                            thrd[(int)pe.th32ProcessID] = (int)pe.cntThreads;
+                        } while (Native.Process32NextW(snap, ref pe));
+                    }
+                }
+                catch { }
+                finally { Native.CloseHandle(snap); }
+            }
+
+            foreach (Process p in Process.GetProcesses())
+            {
+                IntPtr h = IntPtr.Zero;
+                try
+                {
+                    AppNode n = new AppNode();
+                    n.Pid = p.Id;
+                    n.Name = p.ProcessName;
+                    n.IsSelf = (p.Id == selfPid);
+                    n.Threads = thrd.ContainsKey(p.Id) ? thrd[p.Id] : 0;
+                    n.ParentPid = ppid.ContainsKey(p.Id) ? ppid[p.Id] : 0;
+                    try { n.MB = p.WorkingSet64 / 1048576; } catch { n.MB = 0; }
+
+                    h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, p.Id);
+                    if (h != IntPtr.Zero)
+                    {
+                        long create, exit, kernel, user;
+                        if (Native.GetProcessTimes(h, out create, out exit, out kernel, out user))
+                        {
+                            n.CpuMs = (kernel + user) / 10000;      // 100 纳秒 → 毫秒
+                            // 系统进程（System / wininit / csrss 这些）读出来 create 是 0，
+                            // FromFileTime(0) = 1601-01-01，减出来就是七十多万天。必须挡住。
+                            if (create > 0)
+                            {
+                                try
+                                {
+                                    DateTime st = DateTime.FromFileTime(create);
+                                    if (st.Year >= 2000 && st <= DateTime.Now) n.Start = st;
+                                }
+                                catch { }
+                            }
+                        }
+                        Native.IO_COUNTERS io;
+                        if (Native.GetProcessIoCounters(h, out io))
+                            n.DiskMB = (io.ReadTransferCount + io.WriteTransferCount) / 1048576.0;
+                        n.Path = Native.ProcessPathOf(h);
+                    }
+                    else noAccess++;
+
+                    IntPtr w;
+                    if (wins.TryGetValue(p.Id, out w)) { n.Hwnd = w; n.HasWindow = true; }
+                    byId[p.Id] = n;
+                }
+                catch { }
+                finally { if (h != IntPtr.Zero) Native.CloseHandle(h); try { p.Dispose(); } catch { } }
+            }
+
+            List<AppNode> all = new List<AppNode>(byId.Values);
+            foreach (AppNode n in all)
+            {
+                if (n.ParentPid <= 0 || n.ParentPid == n.Pid) continue;
+                AppNode par;
+                if (!byId.TryGetValue(n.ParentPid, out par)) continue;
+                // 防环：PID 被回收后父进程可能指向自己的后代，那样递归会栈溢出
+                bool cyc = false;
+                AppNode t = par;
+                for (int i = 0; i < 64 && t != null; i++)
+                {
+                    if (t == n) { cyc = true; break; }
+                    t = t.Parent;
+                }
+                if (cyc) continue;
+                n.Parent = par;
+                par.Kids.Add(n);
+            }
+
+            List<AppNode> roots = new List<AppNode>();
+            foreach (AppNode n in all) if (n.Parent == null) roots.Add(n);
+            foreach (AppNode r in roots) SetRoot(r, r);
+            foreach (AppNode r in roots) SortTree(r);
+            roots.Sort(delegate (AppNode a, AppNode b) { return b.TotalMB.CompareTo(a.TotalMB); });
+
+            if (noAccess > 0) note = noAccess + " 个进程的详情读不到（权限不够，属正常现象）";
+            return roots;
+        }
+
+        private static void SetRoot(AppNode n, AppNode r)
+        {
+            n.Root = r;
+            foreach (AppNode k in n.Kids) SetRoot(k, r);
+        }
+
+        private static void SortTree(AppNode n)
+        {
+            n.Kids.Sort(delegate (AppNode a, AppNode b) { return b.TotalMB.CompareTo(a.TotalMB); });
+            foreach (AppNode k in n.Kids) SortTree(k);
+        }
+
+        // 排序方式：内存（默认）/ CPU 累计 / 名字 / 启动时间
+        internal const int SortMem = 0;
+        internal const int SortCpu = 1;
+        internal const int SortName = 2;
+        internal const int SortStart = 3;
+
+        internal static int CompareBy(AppNode a, AppNode b, int mode)
+        {
+            switch (mode)
+            {
+                case SortCpu:
+                    return b.CpuMs.CompareTo(a.CpuMs);
+                case SortName:
+                    return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+                case SortStart:
+                    // 后起来的排前面 —— 刚冒出来的进程才是「谁又跑起来了」的答案。
+                    // 读不到启动时间的（系统进程）一律沉到最后，不能拿 MinValue 当排序键。
+                    long ta = (a.Start == DateTime.MinValue ? long.MinValue : a.Start.Ticks);
+                    long tb = (b.Start == DateTime.MinValue ? long.MinValue : b.Start.Ticks);
+                    return tb.CompareTo(ta);
+                default:
+                    return b.TotalMB.CompareTo(a.TotalMB);
+            }
+        }
+
+        internal static void SortAll(List<AppNode> roots, int mode)
+        {
+            roots.Sort(delegate (AppNode a, AppNode b) { return CompareBy(a, b, mode); });
+            foreach (AppNode r in roots) SortTree(r, mode);
+        }
+
+        internal static void SortTree(AppNode n, int mode)
+        {
+            n.Kids.Sort(delegate (AppNode a, AppNode b) { return CompareBy(a, b, mode); });
+            foreach (AppNode k in n.Kids) SortTree(k, mode);
+        }
+
+        // 整棵树一共占了多少内存（用户最关心的那一个数）
+        internal static long TotalOf(List<AppNode> roots)
+        {
+            long mb = 0;
+            foreach (AppNode r in roots) mb += r.TotalMB;
+            return mb;
+        }
+
+        // 收集一棵子树里的全部进程（含自己）
+        internal static void Collect(AppNode n, List<AppNode> into)
+        {
+            into.Add(n);
+            foreach (AppNode k in n.Kids) Collect(k, into);
+        }
+
+        internal static string RootText(AppNode r)
+        {
+            if (r.Kids.Count == 0)
+                return r.Name + "   ·   " + Mb(r.MB) + "   ·   pid " + r.Pid + "   ·   " + Age(r);
+            return r.Name + "   ·   合计 " + Mb(r.TotalMB) + "   ·   " + r.Count + " 个进程   ·   " + Age(r);
+        }
+
+        internal static string KidText(AppNode n)
+        {
+            return n.Name + "   ·   " + Mb(n.MB) + "   ·   pid " + n.Pid + "   ·   " + Age(n);
+        }
+
+        // 结束「这一个」进程（按 PID，不是按名字全杀）
+        internal static string KillPid(int pid)
+        {
+            if (pid <= 0) return "没有选中任何进程。";
+            if (pid == Process.GetCurrentProcess().Id) return "这是 SmoothWin 自己，不能关。";
+            Process p = null;
+            try
+            {
+                p = Process.GetProcessById(pid);
+                string n = p.ProcessName;
+                if (Trimmer.InList(Startup.NeverKill, n))
+                    return "「" + n + "」是系统组件，程序不会去结束它。";
+                long mb = 0;
+                try { mb = p.WorkingSet64 / 1048576; } catch { }
+                p.Kill();
+                return "已结束「" + n + "」(pid " + pid + ")，释放约 " + mb + " MB 内存。";
+            }
+            catch (ArgumentException) { return "这个进程已经不在了（可能自己退出了）。"; }
+            catch (Exception ex)
+            {
+                return "结束失败：" + ex.Message + "。如果提示拒绝访问，点左下角「以管理员身份重新打开」再试。";
+            }
+            finally { if (p != null) { try { p.Dispose(); } catch { } } }
+        }
+
+        // 结束「一组」：顶层程序 + 它下面全部子进程
+        internal static string KillGroup(AppNode root)
+        {
+            List<AppNode> all = new List<AppNode>();
+            Collect(root, all);
+            int ok = 0, skip = 0;
+            long mb = 0;
+            string err = "";
+            int selfPid = Process.GetCurrentProcess().Id;
+            foreach (AppNode n in all)
+            {
+                if (n.Pid == selfPid || Trimmer.InList(Startup.NeverKill, n.Name)) { skip++; continue; }
+                Process p = null;
+                try
+                {
+                    p = Process.GetProcessById(n.Pid);
+                    mb += n.MB;
+                    p.Kill();
+                    ok++;
+                }
+                catch (ArgumentException) { }
+                catch (Exception ex) { err = ex.Message; }
+                finally { if (p != null) { try { p.Dispose(); } catch { } } }
+            }
+            StringBuilder b = new StringBuilder();
+            b.Append("已结束 ").Append(ok).Append(" 个进程，释放约 ").Append(mb).Append(" MB 内存。");
+            if (skip > 0) b.Append("  跳过 ").Append(skip).Append(" 个（系统组件或本程序自己）。");
+            if (err.Length > 0) b.Append("  有进程没能结束：").Append(err);
+            return b.ToString();
+        }
+    }
+
+    // ==================== 后台应用窗口 ====================
+    // 自启项回答「开机时谁自己起来了」，这个窗口回答「现在谁在跑、谁在占内存、谁又生了孩子」。
+    // 两者拆开：自启项那张表是注册表里的静态清单，这里的树是此刻内存里的活进程。
+    internal class AppForm : Form
+    {
+        private TrayApp app;
+        private TreeView tv;
+        private Label lHead, lHint;
+        private TextBox tbFind, box;
+        private Button bKill, bKillAll, bCloseWin, bFront, bOpen, bRefresh, bCopy, bExport, bStartup, bClose;
+        private CheckBox cbBig, cbAuto;
+        private System.Windows.Forms.Timer tAuto;
+        private System.Windows.Forms.Timer tFind;
+        private ComboBox cbSort;
+        private ContextMenuStrip menu;
+        private List<AppNode> roots = new List<AppNode>();
+        private string scanNote = "";
+        private int sortMode = AppScan.SortMem;
+        private long lastTotalMB;
+
+        public AppForm(TrayApp owner)
+        {
+            app = owner;
+            Text = "SmoothWin 后台应用";
+            ClientSize = new Size(940, 620);
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MinimizeBox = false;
+            MaximizeBox = true;
+            ShowInTaskbar = true;
+            Font = new Font("Microsoft YaHei UI", 9f);
+            BackColor = Color.FromArgb(244, 246, 249);
+
+            int W = ClientSize.Width, H = ClientSize.Height;
+
+            lHead = new Label();
+            lHead.AutoSize = false;
+            lHead.SetBounds(12, 10, W - 24, 20);
+            lHead.Font = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold);
+            lHead.Text = "现在在跑的后台应用";
+            Controls.Add(lHead);
+
+            lHint = new Label();
+            lHint.AutoSize = false;
+            lHint.SetBounds(12, 32, W - 24, 18);
+            lHint.ForeColor = Color.FromArgb(122, 128, 138);
+            lHint.Text = "只在这里看，不选中就不动任何东西。左边点一行，右边就是它的全部信息；带加号的行说明它下面还有子进程。右键那一行有更多操作。";
+            Controls.Add(lHint);
+
+            Label lFind = new Label();
+            lFind.AutoSize = false;
+            lFind.SetBounds(12, 60, 42, 22);
+            lFind.Text = "筛选:";
+            Controls.Add(lFind);
+
+            tbFind = new TextBox();
+            tbFind.SetBounds(56, 57, 240, 24);
+            tbFind.TextChanged += delegate { tFind.Stop(); tFind.Start(); };
+            Controls.Add(tbFind);
+
+            cbBig = new CheckBox();
+            cbBig.AutoSize = true;
+            cbBig.SetBounds(306, 58, 190, 22);
+            cbBig.Text = "只看占内存 100 MB 以上";
+            cbBig.CheckedChanged += delegate { Reload(); };
+            Controls.Add(cbBig);
+
+            cbAuto = new CheckBox();
+            cbAuto.AutoSize = true;
+            cbAuto.SetBounds(506, 58, 150, 22);
+            cbAuto.Text = "每 5 秒自动刷新";
+            Controls.Add(cbAuto);
+
+            Label lSort = new Label();
+            lSort.AutoSize = false;
+            lSort.SetBounds(668, 60, 42, 22);
+            lSort.Text = "排序:";
+            Controls.Add(lSort);
+
+            cbSort = new ComboBox();
+            cbSort.DropDownStyle = ComboBoxStyle.DropDownList;
+            cbSort.SetBounds(710, 57, 150, 24);
+            cbSort.Items.Add("占内存最多");
+            cbSort.Items.Add("CPU 用得最多");
+            cbSort.Items.Add("按名字");
+            cbSort.Items.Add("最近才启动的");
+            cbSort.SelectedIndex = 0;
+            cbSort.SelectedIndexChanged += delegate
+            {
+                if (cbSort.SelectedIndex >= 0) sortMode = cbSort.SelectedIndex;
+                Reload();
+            };
+            Controls.Add(cbSort);
+
+            tv = new TreeView();
+            tv.SetBounds(12, 88, 600, H - 178);
+            tv.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            tv.CheckBoxes = true;
+            tv.HideSelection = false;
+            tv.FullRowSelect = true;
+            tv.ShowLines = true;
+            tv.ShowRootLines = true;
+            tv.ItemHeight = 22;
+            tv.BackColor = Color.White;
+            tv.AfterSelect += delegate { OnSelect(); };
+            tv.NodeMouseDoubleClick += delegate { OpenLocation(); };
+            // 右键必须先让这一行变成选中行。TreeView 默认右键不改选中项，
+            // 那样会变成「看着点 A、实际关掉上一次选的 B」—— 杀进程的按钮上这不能忍。
+            tv.NodeMouseClick += delegate (object s, TreeNodeMouseClickEventArgs e)
+            {
+                if (e.Button == MouseButtons.Right && e.Node != null) tv.SelectedNode = e.Node;
+            };
+            tv.AfterCheck += delegate (object s, TreeViewEventArgs e)
+            {
+                // 勾父节点 = 连同它下面的子进程一起勾/去勾
+                if (e.Node == null) return;
+                SetKidsChecked(e.Node, e.Node.Checked);
+            };
+            Controls.Add(tv);
+
+            box = new TextBox();
+            box.Multiline = true;
+            box.ReadOnly = true;
+            box.ScrollBars = ScrollBars.Vertical;
+            box.WordWrap = true;
+            box.Font = new Font("Microsoft YaHei UI", 9f);
+            box.BackColor = Color.FromArgb(250, 251, 253);
+            box.BorderStyle = BorderStyle.FixedSingle;
+            box.TabStop = false;
+            box.HideSelection = true;
+            box.SetBounds(620, 88, W - 632, H - 178);
+            box.Anchor = AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom;
+            box.Text = "左边选一个进程，这里会显示它的启动时间、已经跑了多久、占多大内存、磁盘读写了多少。";
+            Controls.Add(box);
+
+            // 右键菜单：树上的常用动作，省得每次把鼠标拖到底下的按钮条。
+            menu = new ContextMenuStrip();
+            menu.Items.Add("切到前台", null, delegate { BringFront(); });
+            menu.Items.Add("关闭窗口（先让它自己保存）", null, delegate { CloseWin(); });
+            menu.Items.Add("打开所在位置", null, delegate { OpenLocation(); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("结束这个进程", null, delegate { KillSel(); });
+            menu.Items.Add("结束整个程序组", null, delegate { KillGroupSel(); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("复制这一行的信息", null, delegate { CopyOne(); });
+            menu.Opening += delegate (object s, System.ComponentModel.CancelEventArgs e)
+            {
+                AppNode n = Selected();
+                bool has = n != null;
+                bool sys = has && Trimmer.InList(Startup.NeverKill, n.Name);
+                menu.Items[0].Enabled = has && n.HasWindow;
+                menu.Items[1].Enabled = has && n.HasWindow;
+                menu.Items[2].Enabled = has && n.Path.Length > 0;
+                menu.Items[4].Enabled = has && !sys && !n.IsSelf;
+                menu.Items[5].Enabled = has && !sys && !n.IsSelf;
+                menu.Items[7].Enabled = has;
+            };
+            tv.ContextMenuStrip = menu;
+
+            tFind = new System.Windows.Forms.Timer();
+            tFind.Interval = 400;
+            tFind.Tick += delegate { tFind.Stop(); Reload(); };
+
+            // 自动刷新只在窗口看得见的时候扫，窗口一关就停 —— 后台每秒枚举 400 个进程是纯浪费。
+            tAuto = new System.Windows.Forms.Timer();
+            tAuto.Interval = 5000;
+            tAuto.Tick += delegate { if (cbAuto.Checked && Visible) Reload(); };
+            tAuto.Start();
+
+            FormClosed += delegate { tAuto.Stop(); tFind.Stop(); };
+
+            int by1 = H - 76, by2 = H - 42;
+            bKill = MkBtn("结束这个进程", 12, by1, 130, false);
+            bKill.Click += delegate { KillSel(); };
+            bKillAll = MkBtn("结束整个程序组", 148, by1, 140, false);
+            bKillAll.Click += delegate { KillGroupSel(); };
+            bCloseWin = MkBtn("关闭窗口", 294, by1, 100, false);
+            bCloseWin.Click += delegate { CloseWin(); };
+            bFront = MkBtn("切到前台", 400, by1, 100, false);
+            bFront.Click += delegate { BringFront(); };
+            bOpen = MkBtn("打开所在位置", 506, by1, 120, false);
+            bOpen.Click += delegate { OpenLocation(); };
+            bRefresh = MkBtn("刷新", 12, by2, 80, false);
+            bRefresh.Click += delegate { Reload(); };
+            bCopy = MkBtn("复制清单", 98, by2, 100, false);
+            bCopy.Click += delegate { CopyList(); };
+            bExport = MkBtn("导出清单…", 204, by2, 110, false);
+            bExport.Click += delegate { ExportList(); };
+            bStartup = MkBtn("开机自启项", 320, by2, 110, false);
+            bStartup.Click += delegate { app.ShowStartup(); };
+            bClose = MkBtn("关闭", W - 112, by2, 100, true);
+            bClose.Click += delegate { Close(); };
+
+            Reload();
+        }
+
+        private Button MkBtn(string text, int x, int y, int w, bool rightAnchor)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.SetBounds(x, y, w, 30);
+            b.FlatStyle = FlatStyle.System;
+            b.Anchor = rightAnchor ? (AnchorStyles.Right | AnchorStyles.Bottom) : (AnchorStyles.Left | AnchorStyles.Bottom);
+            Controls.Add(b);
+            return b;
+        }
+
+        private static void SetKidsChecked(TreeNode n, bool on)
+        {
+            foreach (TreeNode c in n.Nodes) { c.Checked = on; SetKidsChecked(c, on); }
+        }
+
+        private void Reload()
+        {
+            try
+            {
+                string note;
+                List<AppNode> list = AppScan.Take(out note);
+                AppScan.SortAll(list, sortMode);   // 用户选的排序方式
+                roots = list;
+                scanNote = note;
+                lastTotalMB = AppScan.TotalOf(list);
+                string f = (tbFind.Text == null ? "" : tbFind.Text.Trim());
+                tv.BeginUpdate();
+                tv.Nodes.Clear();
+                int shown = 0;
+                foreach (AppNode r in list)
+                {
+                    if (!Keep(r, f)) continue;
+                    TreeNode tn = new TreeNode(AppScan.RootText(r));
+                    tn.Tag = r;
+                    tn.Checked = r.Kids.Count > 0;
+                    AddKids(tn, r, f);
+                    tv.Nodes.Add(tn);
+                    shown++;
+                    // 有子进程、又不是小角色的，默认展开 —— 用户要看的正是「谁生了谁」
+                    if (r.Kids.Count > 0 && r.TotalMB >= 50) tn.Expand();
+                }
+                tv.EndUpdate();
+                lHead.Text = "现在在跑的后台应用：共 " + list.Count + " 个顶层程序"
+                    + (f.Length > 0 ? "（筛选后显示 " + shown + " 个）" : "")
+                    + "   ·   全部合计 " + AppScan.Mb(lastTotalMB)
+                    + (scanNote.Length > 0 ? "   ·   " + scanNote : "");
+                OnSelect();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "读取进程失败：" + ex.Message, "后台应用",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private static bool Match(AppNode n, string f)
+        {
+            if (n.Name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            foreach (AppNode k in n.Kids) if (Match(k, f)) return true;
+            return false;
+        }
+
+        private bool Keep(AppNode n, string f)
+        {
+            // 文字筛选：名字对得上就留；对不上但它的子进程对得上，也留（不然看不到「谁生的它」）。
+            if (f.Length > 0 && !Match(n, f)) return false;
+            // 大占用筛选：自己小但下面挂着大进程的，同样要留 —— 那才是真正吃内存的那一层。
+            if (cbBig.Checked && n.TotalMB < 100) return false;
+            return true;
+        }
+
+        private void AddKids(TreeNode tn, AppNode n, string f)
+        {
+            foreach (AppNode k in n.Kids)
+            {
+                if (!Keep(k, f)) continue;
+                TreeNode c = new TreeNode(AppScan.KidText(k));
+                c.Tag = k;
+                c.Checked = k.Kids.Count > 0;
+                AddKids(c, k, f);
+                tn.Nodes.Add(c);
+            }
+        }
+
+        private AppNode Selected()
+        {
+            if (tv.SelectedNode == null) return null;
+            return tv.SelectedNode.Tag as AppNode;
+        }
+
+        private bool NeedSelect()
+        {
+            if (Selected() != null) return true;
+            MessageBox.Show(this, "先在左边点一个进程。", "后台应用",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return false;
+        }
+
+
+        private void OnSelect()
+        {
+            AppNode n = Selected();
+            if (n == null)
+            {
+                box.Text = "左边选一个进程，这里会显示它的启动时间、已经跑了多久、占多大内存、磁盘读写了多少。";
+            }
+            else
+            {
+                StringBuilder b = new StringBuilder();
+                b.AppendLine("名称    : " + n.Name + (n.IsSelf ? "   <- 这就是 SmoothWin 自己" : ""));
+                b.AppendLine("PID     : " + n.Pid);
+                AppNode p = n.Parent;
+                if (p != null) b.AppendLine("父进程  : " + p.Name + " (pid " + p.Pid + ")");
+                else b.AppendLine("父进程  : 没有（它是最上层的程序，父进程已经不在了）");
+                b.AppendLine("启动时间: " + (n.Start == DateTime.MinValue ? "读不到" : n.Start.ToString("yyyy-MM-dd HH:mm:ss")));
+                b.AppendLine("已运行  : " + AppScan.Age(n));
+                b.AppendLine("内存    : " + AppScan.Mb(n.MB)
+                    + (n.Kids.Count > 0 ? "（连子进程一共 " + AppScan.Mb(n.TotalMB) + "）" : ""));
+                b.AppendLine("CPU 累计: " + AppScan.Dur(TimeSpan.FromMilliseconds(n.CpuMs)));
+                b.AppendLine("磁盘累计: " + (n.DiskMB >= 1024 ? (n.DiskMB / 1024.0).ToString("0.00") + " GB" : n.DiskMB.ToString("0.0") + " MB"));
+                b.AppendLine("线程数  : " + n.Threads);
+                b.AppendLine("窗口    : " + (n.HasWindow ? "有（可以「关闭窗口」或「切到前台」）" : "没有（它躲在后台跑）"));
+                string d = AppScan.Describe(n.Name);
+                if (d.Length > 0) b.AppendLine("这是啥  : " + d);
+                b.AppendLine("子进程  : " + n.Kids.Count + " 个"
+                    + (n.Kids.Count > 0 ? "（连它自己一共 " + n.Count + " 个）" : ""));
+                if (n.Path.Length > 0)
+                {
+                    b.AppendLine();
+                    b.AppendLine("程序位置:");
+                    b.AppendLine(n.Path);
+                }
+                box.Text = b.ToString();
+                box.SelectionStart = 0;
+                box.SelectionLength = 0;
+            }
+            SyncButtons();
+        }
+
+        private void SyncButtons()
+        {
+            AppNode n = Selected();
+            bool sys = n != null && Trimmer.InList(Startup.NeverKill, n.Name);
+            bKill.Enabled = n != null && !sys && !n.IsSelf;
+            bKillAll.Enabled = n != null && !sys && !n.IsSelf;
+            bCloseWin.Enabled = n != null && n.HasWindow;
+            bFront.Enabled = n != null && n.HasWindow;
+            bOpen.Enabled = n != null && n.Path.Length > 0;
+        }
+
+        private void KillSel()
+        {
+            if (!NeedSelect()) return;
+            AppNode n = Selected();
+            string nl = Environment.NewLine + Environment.NewLine;
+            string msg = "确定要结束「" + n.Name + "」(pid " + n.Pid + ") 吗？" + nl
+                + "没有保存的工作会丢失。它下面还有 " + n.Kids.Count + " 个子进程，关这个不会连它们一起关。";
+            if (MessageBox.Show(this, msg, "结束进程", MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            string r = AppScan.KillPid(n.Pid);
+            MessageBox.Show(this, r, "结束进程", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Reload();
+        }
+
+        private void KillGroupSel()
+        {
+            if (!NeedSelect()) return;
+            AppNode n = Selected();
+            AppNode r0 = (n.Root == null ? n : n.Root);
+            if (r0.IsSelf)
+            {
+                MessageBox.Show(this, "这是 SmoothWin 自己，不能关。", "结束进程",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            string nl = Environment.NewLine + Environment.NewLine;
+            string msg = "确定要结束「" + r0.Name + "」以及它下面全部 " + (r0.Count - 1)
+                + " 个子进程吗？" + nl + "一共 " + r0.Count + " 个进程，合计 " + AppScan.Mb(r0.TotalMB)
+                + " 内存。没有保存的工作会丢失。";
+            if (MessageBox.Show(this, msg, "结束整个程序组", MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            string r = AppScan.KillGroup(r0);
+            MessageBox.Show(this, r, "结束整个程序组", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Reload();
+        }
+
+        private void CloseWin()
+        {
+            if (!NeedSelect()) return;
+            AppNode n = Selected();
+            if (!n.HasWindow) return;
+            // 发 WM_CLOSE：程序该弹「保存吗」的会自己弹，比直接杀进程安全。
+            Native.PostMessageW(n.Hwnd, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            System.Threading.Thread.Sleep(400);
+            Reload();
+        }
+
+        private void BringFront()
+        {
+            if (!NeedSelect()) return;
+            AppNode n = Selected();
+            if (!n.HasWindow) return;
+            try { Native.SetForegroundWindow(n.Hwnd); }
+            catch { }
+        }
+
+        private void OpenLocation()
+        {
+            if (!NeedSelect()) return;
+            AppNode n = Selected();
+            string p = n.Path;
+            if (p.Length == 0)
+            {
+                MessageBox.Show(this, "这一项取不到程序路径（多半是权限不够的进程）。", "打开所在位置",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            try { Process.Start("explorer.exe", "/select,\"" + p + "\""); }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "打开所在位置",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void CopyList()
+        {
+            StringBuilder b = new StringBuilder();
+            b.AppendLine("SmoothWin 后台应用清单  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            b.AppendLine();
+            foreach (AppNode r in roots) DumpNode(b, r, 0);
+            try
+            {
+                Clipboard.SetText(b.ToString());
+                MessageBox.Show(this, "已复制到剪贴板。", "复制清单",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "复制清单",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        // 只复制选中这一行的信息 —— 用户想贴给别人的往往就是一个进程，不是整份清单。
+        private void CopyOne()
+        {
+            AppNode n = Selected();
+            if (n == null) return;
+            StringBuilder b = new StringBuilder();
+            b.AppendLine("名称    : " + n.Name);
+            b.AppendLine("PID     : " + n.Pid);
+            b.AppendLine("内存    : " + AppScan.Mb(n.MB)
+                + (n.Kids.Count > 0 ? "（连子进程一共 " + AppScan.Mb(n.TotalMB) + "，" + n.Count + " 个进程）" : ""));
+            b.AppendLine("启动时间: " + (n.Start == DateTime.MinValue ? "读不到" : n.Start.ToString("yyyy-MM-dd HH:mm:ss")));
+            b.AppendLine("已运行  : " + AppScan.Age(n));
+            b.AppendLine("CPU 累计: " + AppScan.Dur(TimeSpan.FromMilliseconds(n.CpuMs)));
+            b.AppendLine("磁盘累计: " + n.DiskMB.ToString("0.0") + " MB");
+            if (n.Path.Length > 0) b.AppendLine("程序位置: " + n.Path);
+            try
+            {
+                Clipboard.SetText(b.ToString());
+                MessageBox.Show(this, "已复制这一行的信息。", "复制",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "复制",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void ExportList()
+        {
+            SaveFileDialog d = new SaveFileDialog();
+            d.Title = "导出后台应用清单";
+            d.Filter = "文本文件 (*.txt)|*.txt";
+            d.FileName = "SmoothWin-后台应用-" + DateTime.Now.ToString("yyyyMMdd-HHmm") + ".txt";
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            StringBuilder b = new StringBuilder();
+            b.AppendLine("SmoothWin 后台应用清单  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            b.AppendLine("（缩进表示父子关系；同一行是：名字 pid= 内存 启动时间 已运行）");
+            b.AppendLine();
+            foreach (AppNode r in roots) DumpNode(b, r, 0);
+            try
+            {
+                File.WriteAllText(d.FileName, b.ToString(), new UTF8Encoding(true));
+                MessageBox.Show(this, "已导出到：" + d.FileName, "导出清单",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "导出清单",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private static void DumpNode(StringBuilder b, AppNode n, int depth)
+        {
+            b.Append(new string(' ', depth * 2));
+            b.Append(n.Name).Append("  pid=").Append(n.Pid)
+             .Append("  ").Append(AppScan.Mb(n.MB))
+             .Append("  启动=").Append(n.Start == DateTime.MinValue ? "?" : n.Start.ToString("HH:mm:ss"))
+             .Append("  已运行=").Append(AppScan.Age(n)).AppendLine();
+            foreach (AppNode k in n.Kids) DumpNode(b, k, depth + 1);
+        }
+
+        // ---- 给命令行自检用 ----
+        internal string DumpForTest()
+        {
+            StringBuilder b = new StringBuilder();
+            b.AppendLine("标题        : " + Text);
+            b.AppendLine("客户区      : " + ClientSize.Width + " x " + ClientSize.Height);
+            b.AppendLine("管理员      : " + Trimmer.IsAdmin + "   进程完整性=" + Startup.CurrentIntegrity());
+            b.AppendLine("顶层程序数  : " + roots.Count + (scanNote.Length > 0 ? "   (" + scanNote + ")" : ""));
+            int nodes = 0, kids = 0;
+            foreach (AppNode r in roots) { nodes += r.Count; if (r.Kids.Count > 0) kids++; }
+            b.AppendLine("进程总数    : " + nodes + "   其中 " + kids + " 个顶层程序带子进程");
+            b.AppendLine("树里的行数  : " + CountRows(tv.Nodes));
+            b.AppendLine();
+            b.AppendLine("--- 前 20 个顶层程序（名字 / 合计内存 / 进程数 / 跑了多久 / 子进程数）---");
+            int i = 0;
+            foreach (AppNode r in roots)
+            {
+                if (i++ >= 20) break;
+                b.Append("  ").Append(i).Append(". ").Append(r.Name)
+                 .Append("  ").Append(AppScan.Mb(r.TotalMB))
+                 .Append("  ").Append(r.Count).Append(" 个进程")
+                 .Append("  跑了 ").Append(AppScan.Age(r))
+                 .Append("  子进程 ").Append(r.Kids.Count).AppendLine();
+            }
+            b.AppendLine();
+            b.AppendLine("--- 按钮右边缘（都要 <= " + ClientSize.Width + "）---");
+            foreach (Control c in Controls)
+            {
+                Button btn = c as Button;
+                if (btn == null) continue;
+                b.Append("  ").Append(btn.Text).Append(" 右边缘=").Append(btn.Right)
+                 .Append(btn.Right <= ClientSize.Width ? "  OK" : "  出界了").AppendLine();
+            }
+            return b.ToString();
+        }
+
+        private static int CountRows(TreeNodeCollection ns)
+        {
+            int n = 0;
+            foreach (TreeNode t in ns) n += 1 + CountRows(t.Nodes);
+            return n;
+        }
+
+        // 真实地开一个子进程、在树里找到它、再按 PID 关掉它 —— 全程走用户点按钮时走的同一段代码。
+        internal string SelfTestKill()
+        {
+            StringBuilder b = new StringBuilder();
+            Process a = null, c = null;
+            try
+            {
+                a = Process.Start("ping.exe", "-n 25 127.0.0.1");
+                c = Process.Start("ping.exe", "-n 25 127.0.0.1");
+                if (a == null || c == null) { b.AppendLine("起不来测试进程（ping.exe）。"); return b.ToString(); }
+                System.Threading.Thread.Sleep(700);
+
+                string note;
+                List<AppNode> list = AppScan.Take(out note);
+                int selfPid = Process.GetCurrentProcess().Id;
+                // 注意：这里必须递归找整棵树。ping 挂在 SmoothWinTray 自己下面，
+                // 而 SmoothWinTray 通常不是顶层（父进程是 explorer），只扫 list 永远找不到。
+                AppNode self = FindPid(list, selfPid);
+                AppNode ka = FindPid(list, a.Id);
+                AppNode kc = FindPid(list, c.Id);
+                b.AppendLine("测试子进程  : a=pid " + a.Id + "   c=pid " + c.Id);
+                b.AppendLine("在树里找到  : a=" + (ka != null ? "找到了" : "没找到")
+                    + "   c=" + (kc != null ? "找到了" : "没找到"));
+                b.AppendLine("父进程认对了: a=" + (ka != null && ka.ParentPid == selfPid
+                    ? "是（父进程就是本程序）"
+                    : "否（父进程=" + (ka == null ? "?" : ka.ParentPid.ToString()) + "）"));
+                if (self != null)
+                {
+                    bool inTree = false;
+                    foreach (AppNode k in self.Kids) if (k.Pid == a.Id || k.Pid == c.Id) inTree = true;
+                    b.AppendLine("挂在自程序下: " + (inTree ? "是（树里是本程序 -> ping 子进程）" : "否"));
+                    b.AppendLine("自程序子进程: " + self.Kids.Count + " 个");
+                }
+
+                b.AppendLine();
+                b.AppendLine("--- 关掉其中一个（按 PID）---");
+                b.AppendLine("KillPid     : " + AppScan.KillPid(a.Id));
+                System.Threading.Thread.Sleep(500);
+                b.AppendLine("a 还在吗    : " + (Alive(a.Id) ? "还在（没关掉）" : "已经没了 OK"));
+                b.AppendLine("c 还在吗    : " + (Alive(c.Id) ? "还在 OK（只关了 a，没有连坐）" : "也没了（不该）"));
+
+                b.AppendLine();
+                b.AppendLine("--- 关掉整组 ---");
+                if (self != null)
+                {
+                    b.AppendLine("KillGroup   : " + AppScan.KillGroup(self));
+                    System.Threading.Thread.Sleep(500);
+                    b.AppendLine("c 还在吗    : " + (Alive(c.Id) ? "还在（没关掉）" : "已经没了 OK"));
+                    b.AppendLine("本程序还在吗: " + (Alive(selfPid) ? "在 OK（自己不会被自己关掉）" : "没了（严重错误）"));
+                }
+
+                b.AppendLine();
+                b.AppendLine("--- 系统进程保护 ---");
+                b.AppendLine("关 explorer  : " + AppScan.KillPid(PidOf("explorer")));
+                b.AppendLine("关 SmoothWin : " + AppScan.KillPid(selfPid));
+            }
+            catch (Exception ex) { b.AppendLine("自检出错: " + ex.Message); }
+            finally
+            {
+                try { if (a != null && Alive(a.Id)) a.Kill(); }
+                catch { }
+                try { if (c != null && Alive(c.Id)) c.Kill(); }
+                catch { }
+                if (a != null) a.Dispose();
+                if (c != null) c.Dispose();
+            }
+            return b.ToString();
+        }
+
+        // 在整棵树里按 PID 找一个节点（顶层 + 所有后代）
+        private static AppNode FindPid(List<AppNode> roots, int pid)
+        {
+            foreach (AppNode r in roots)
+            {
+                AppNode hit = FindPidIn(r, pid);
+                if (hit != null) return hit;
+            }
+            return null;
+        }
+
+        private static AppNode FindPidIn(AppNode n, int pid)
+        {
+            if (n == null) return null;
+            if (n.Pid == pid) return n;
+            foreach (AppNode k in n.Kids)
+            {
+                AppNode hit = FindPidIn(k, pid);
+                if (hit != null) return hit;
+            }
+            return null;
+        }
+
+        // 自检新增的几样：排序真的生效了没有、右键菜单在不在、右键会不会先选中。
+        internal string SelfTestExtras()
+        {
+            StringBuilder b = new StringBuilder();
+            try
+            {
+                b.AppendLine("排序方式数  : " + cbSort.Items.Count + " 种（" + cbSort.Items[0] + " / " + cbSort.Items[1]
+                    + " / " + cbSort.Items[2] + " / " + cbSort.Items[3] + "）");
+
+                int[] modes = new int[] { AppScan.SortMem, AppScan.SortCpu, AppScan.SortName, AppScan.SortStart };
+                string[] names = new string[] { "占内存最多", "CPU 用得最多", "按名字", "最近才启动的" };
+                for (int i = 0; i < modes.Length; i++)
+                {
+                    cbSort.SelectedIndex = i;      // 走用户点下拉框时走的同一条路
+                    Application.DoEvents();
+                    bool ok = true;
+                    string why = "";
+                    for (int k = 1; k < roots.Count; k++)
+                    {
+                        int c = AppScan.CompareBy(roots[k - 1], roots[k], modes[i]);
+                        if (c > 0) { ok = false; why = "第 " + k + " 和第 " + (k + 1) + " 个顺序反了"; break; }
+                    }
+                    b.AppendLine("排序 " + names[i] + "  : " + (ok ? "整棵树都是这个顺序 OK" : "没排对 —— " + why)
+                        + "（第一个是 " + (roots.Count > 0 ? roots[0].Name : "无") + "）");
+                }
+                cbSort.SelectedIndex = 0;
+                Application.DoEvents();
+
+                b.AppendLine("右键菜单    : " + (menu == null ? "没有" : menu.Items.Count + " 项（" + menu.Items[0].Text + " / "
+                    + menu.Items[4].Text + " / " + menu.Items[5].Text + "）"));
+                b.AppendLine("树上挂了菜单: " + (tv.ContextMenuStrip == menu ? "是 OK" : "否（右键出不来）"));
+
+                // 右键要先选中：模拟「右键点第二行」，看 Selected() 会不会跟着变。
+                if (tv.Nodes.Count >= 2)
+                {
+                    tv.SelectedNode = tv.Nodes[0];
+                    Application.DoEvents();
+                    AppNode first = Selected();
+                    tv.SelectedNode = tv.Nodes[1];
+                    Application.DoEvents();
+                    AppNode second = Selected();
+                    b.AppendLine("右键前先选中: " + ((first != null && second != null && first.Pid != second.Pid)
+                        ? "是 OK（换行后选中的 PID 跟着换了）" : "否（选中的还是同一个）"));
+                }
+                else b.AppendLine("右键前先选中: 树里行数不够，跳过");
+
+                b.AppendLine("全部合计内存: " + AppScan.Mb(lastTotalMB));
+                b.AppendLine("标题行      : " + lHead.Text);
+            }
+            catch (Exception ex) { b.AppendLine("扩展自检出错: " + ex.Message); }
+            return b.ToString();
+        }
+
+        private static int PidOf(string name)
+        {
+            try
+            {
+                Process[] ps = Process.GetProcessesByName(name);
+                if (ps.Length > 0)
+                {
+                    int id = ps[0].Id;
+                    foreach (Process p in ps) p.Dispose();
+                    return id;
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        private static bool Alive(int pid)
+        {
+            if (pid <= 0) return false;
+            try
+            {
+                using (Process p = Process.GetProcessById(pid)) { return !p.HasExited; }
+            }
+            catch { return false; }
         }
     }
 
@@ -3305,6 +4427,7 @@ namespace SmoothWinTray
             bx = AddBtn("打开日志", bx, 90, delegate { app.OpenLog(); });
             bx = AddBtn("设备检查", bx, 90, delegate { app.ShowDevices(); });
             bx = AddBtn("自启项", bx, 90, delegate { app.ShowStartup(); });
+            bx = AddBtn("后台应用", bx, 100, delegate { app.ShowApps(); });
             bx = AddBtn("复制报告", bx, 90, delegate { app.CopyReport(); });
             bx = AddBtn("隐藏窗口", bx, 90, delegate { Hide(); });
             // 用户第一反应是关掉窗口上的按钮，而不是去翻右键菜单 —— 出口要放在看得见的地方。
@@ -4328,6 +5451,7 @@ namespace SmoothWinTray
             m.Items.Add("设置…", null, delegate { ShowSettings(); });
             m.Items.Add("检查有问题的设备…", null, delegate { ShowDevices(); });
             m.Items.Add("看看开机自启项…", null, delegate { ShowStartup(); });
+            m.Items.Add("看看后台应用和子进程…", null, delegate { ShowApps(); });
             m.Items.Add("复制当前报告", null, delegate { CopyReport(); });
             m.Items.Add(new ToolStripSeparator());
             m.Items.Add("打开历史记录 (CSV)", null, delegate { Open(Config.HistoryPath); });
@@ -5207,6 +6331,19 @@ namespace SmoothWinTray
             catch (Exception ex) { Balloon("读取自启项失败", ex.Message, ToolTipIcon.Warning); }
         }
 
+        // 「看看后台应用」：和自启项刻意分成两个窗口。
+        //   自启项 = 注册表里的静态清单（开机时谁自己起来）；
+        //   后台应用 = 此刻内存里的活进程树（谁在跑、跑了多久、谁生了谁、能不能关）。
+        // 混在一个表格里两边都看不清楚，用户明确要求拆开。
+        public void ShowApps()
+        {
+            try
+            {
+                using (AppForm f = new AppForm(this)) { f.ShowDialog(); }
+            }
+            catch (Exception ex) { Balloon("读取后台应用失败", ex.Message, ToolTipIcon.Warning); }
+        }
+
         // 「检查有问题的设备」：把设备管理器里那些黄色感叹号列出来，
         // 并给出「去哪装什么驱动」——这是程序唯一修不了、但能帮用户定位的事。
         public void ShowDevices()
@@ -5936,6 +7073,56 @@ namespace SmoothWinTray
                 b.Append(f.ToggleRoundTripForTest());
                 f.Close();
             }
+            else if (mode == "apps")
+            {
+                // 后台应用的文本版：不开窗口，直接把「顶层程序 + 子进程」打成文字。
+                // 给「想贴给别人看」或者不方便开界面的场合用（窗口版是 --appsui）。
+                string note;
+                List<AppNode> list = AppScan.Take(out note);
+                AppScan.SortAll(list, AppScan.SortMem);
+                b.AppendLine("管理员  : " + Trimmer.IsAdmin + "   进程完整性=" + Startup.CurrentIntegrity());
+                b.AppendLine("顶层程序: " + list.Count + " 个   全部合计 " + AppScan.Mb(AppScan.TotalOf(list)));
+                if (note.Length > 0) b.AppendLine("注意    : " + note);
+                b.AppendLine();
+                foreach (AppNode r in list)
+                {
+                    b.AppendLine(AppScan.RootText(r));
+                    foreach (AppNode k in r.Kids) b.AppendLine("    " + AppScan.KidText(k));
+                }
+            }
+            else if (mode == "appsui")
+            {
+                // 后台应用窗口自检：内容 + 按钮位置 + 真实地「起一个子进程再按 PID 关掉它」。
+                TrayApp app = new TrayApp(true);
+                AppForm f = new AppForm(app);
+                f.Show();
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(700);
+                Application.DoEvents();
+                b.Append(f.DumpForTest());
+                b.AppendLine();
+                b.AppendLine("--- 结束子进程实测（真起两个 ping，按 PID 关掉其中一个）---");
+                b.Append(f.SelfTestKill());
+                b.AppendLine();
+                b.AppendLine("--- 排序 / 右键菜单实测 ---");
+                b.Append(f.SelfTestExtras());
+                f.Close();
+            }
+            else if (mode == "appsshot")
+            {
+                // 后台应用窗口截图（给用户看「进程树长什么样」）。
+                // 用 DrawToBitmap 而不是 PrintWindow：锁定/后台会话里 PrintWindow 会截出黑图。
+                TrayApp app = new TrayApp(true);
+                AppForm f = new AppForm(app);
+                f.Show();
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(1200);
+                Application.DoEvents();
+                b.AppendLine("管理员=" + Trimmer.IsAdmin + "  进程完整性=" + Startup.CurrentIntegrity());
+                b.Append(f.DumpForTest());
+                ShotForm(f, Path.Combine(Config.Dir, "apps-preview.png"), b);
+                f.Close();
+            }
             else if (mode == "uicheck")
             {
                 // 状态窗口自检：验证「点通知进来不再未响应」+ 卡片确实被填上数据。
@@ -5995,7 +7182,7 @@ namespace SmoothWinTray
             }
             else
             {
-                b.AppendLine("未知模式。可用: --trim / --report / --selftest / --fix / --restore / --status / --install / --uninstall / --devices / --startup / --uicheck / --settingshot / --startupui / --startupshot / --statusshot / --leaktest / --quit / --quitstate / --clearmark");
+                b.AppendLine("未知模式。可用: --trim / --report / --selftest / --fix / --restore / --status / --install / --uninstall / --devices / --startup / --apps / --uicheck / --settingshot / --startupui / --appsui / --appsshot / --startupshot / --statusshot / --leaktest / --quit / --quitstate / --clearmark");
             }
         }
 
@@ -6004,19 +7191,42 @@ namespace SmoothWinTray
         // PrintWindow 那种路径在锁定会话里会得到一张全黑的图（实测踩过）。
         private static void ShotForm(Form f, string path, StringBuilder b)
         {
-            try
+            string target = path;
+            for (int attempt = 0; attempt < 2; attempt++)
             {
-                f.Refresh();
-                Application.DoEvents();
-                int w = Math.Max(1, f.Width), h = Math.Max(1, f.Height);
-                using (Bitmap bmp = new Bitmap(w, h))
+                try
                 {
-                    f.DrawToBitmap(bmp, new Rectangle(0, 0, w, h));
-                    bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+                    f.Refresh();
+                    Application.DoEvents();
+                    int w = Math.Max(1, f.Width), h = Math.Max(1, f.Height);
+                    using (Bitmap bmp = new Bitmap(w, h))
+                    {
+                        f.DrawToBitmap(bmp, new Rectangle(0, 0, w, h));
+                        bmp.Save(target, System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                    b.AppendLine("截图              : " + target + "  (" + w + "x" + h + ")");
+                    return;
                 }
-                b.AppendLine("截图              : " + path + "  (" + w + "x" + h + ")");
+                catch (Exception ex)
+                {
+                    // 第一次失败多半是旧 png 被占住或权限不给。删掉重试一次，
+                    // 还是不行就换个带时间戳的新名字 —— 自检不能因为一个旧文件而假失败。
+                    b.AppendLine("截图第 " + (attempt + 1) + " 次失败  : " + ex.Message);
+                    try { File.Delete(target); } catch { }
+                    if (attempt == 0)
+                    {
+                        try
+                        {
+                            string dir = Path.GetDirectoryName(path);
+                            string name = Path.GetFileNameWithoutExtension(path)
+                                + "-" + DateTime.Now.ToString("HHmmss") + Path.GetExtension(path);
+                            target = (dir.Length > 0 ? Path.Combine(dir, name) : name);
+                        }
+                        catch { target = path; }
+                    }
+                }
             }
-            catch (Exception ex) { b.AppendLine("截图失败          : " + ex.Message); }
+            b.AppendLine("截图失败          : 两次都没写成功（" + path + "）");
         }
 
         // 单实例互斥体的进程级引用。必须静态持有，因为「退出前先交锁」这个动作
@@ -6075,7 +7285,8 @@ namespace SmoothWinTray
                  argv[0] == "--startup" || argv[0] == "--uicheck" || argv[0] == "--settingshot" ||
                  argv[0] == "--leaktest" || argv[0] == "--startupshot" || argv[0] == "--statusshot" ||
                  argv[0] == "--quit" || argv[0] == "--quitstate" || argv[0] == "--clearmark" ||
-                 argv[0] == "--startupui"))
+                 argv[0] == "--startupui" || argv[0] == "--appsui" || argv[0] == "--appsshot" ||
+                 argv[0] == "--apps"))
             {
                 RunCli(argv);
                 return;
