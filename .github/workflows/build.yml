@@ -1,0 +1,57 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 定位 csc.exe（.NET Framework 4.x）
+        shell: pwsh
+        run: |
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) {
+            $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+          }
+          if (-not (Test-Path $csc)) { throw "找不到 csc.exe，runner 上没有 .NET Framework 4.x" }
+          Write-Host "编译器: $csc"
+          "CSC=$csc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 编译
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          & $env:CSC /nologo /target:winexe /optimize+ /platform:anycpu /codepage:65001 /out:out\SmoothWinTray.exe SmoothWinTray.cs
+          if ($LASTEXITCODE -ne 0) { throw "编译失败，csc 退出码 = $LASTEXITCODE" }
+          if (-not (Test-Path out\SmoothWinTray.exe)) { throw "csc 返回 0 但没有产出 exe" }
+          $fi = Get-Item out\SmoothWinTray.exe
+          Write-Host ("产出: {0}   {1} 字节" -f $fi.Name, $fi.Length)
+          Write-Host ("SHA256: " + (Get-FileHash $fi.FullName -Algorithm SHA256).Hash)
+
+      - name: 冒烟测试（--report）
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'smoke-report.txt'
+          $p = Start-Process -FilePath (Resolve-Path out\SmoothWinTray.exe) `
+               -ArgumentList @('--report', '--out', $out) -PassThru -WindowStyle Hidden
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); throw "冒烟测试超时（180 秒）" }
+          if ($p.ExitCode -ne 0) { throw "冒烟测试退出码 = $($p.ExitCode)" }
+          if (-not (Test-Path $out)) { throw "没有写出报告文件" }
+          $txt = Get-Content $out -Raw -Encoding UTF8
+          Write-Host $txt
+          if ($txt -notmatch 'SmoothWin 命令行模式') { throw "报告内容不对" }
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmoothWinTray
+          path: out/SmoothWinTray.exe
+          if-no-files-found: error

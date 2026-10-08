@@ -1,0 +1,21 @@
+# 编译产物
+*.exe
+out/
+bin/
+obj/
+
+# 自检 / 截图产物（仓库根目录下的临时文件）
+/out-*.txt
+/cli-*.txt
+/*-preview.png
+/界面截图.png
+
+# 本地运行数据
+/SmoothWinData/
+/_uninstall_backup/
+*.log
+
+# 编辑器
+.vs/
+.idea/
+*.user
